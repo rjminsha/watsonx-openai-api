@@ -1,3 +1,4 @@
+import traceback
 from fastapi import FastAPI, Request, HTTPException
 import requests
 import os
@@ -31,6 +32,9 @@ valid_regions = ["us-south", "eu-gb", "jp-tok", "eu-de"]
 region = os.getenv("WATSONX_REGION")
 
 api_version = os.getenv("WATSONX_VERSION") or "2023-05-29"
+on_prem = os.getenv("WATSONX_ON_PREM")
+cpd_url = os.getenv("CPD_URL")
+
 
 # Handle behavior based on environment (Docker vs. Interactive mode)
 if not region or region not in valid_regions:
@@ -65,14 +69,23 @@ WATSONX_URLS = {
 # IBM Cloud IAM URL for fetching the token
 IAM_TOKEN_URL = "https://iam.cloud.ibm.com/identity/token"
 
+# Token url for ON_PREM
+if on_prem == "1":
+    CPD_AUTH_URL = f"{cpd_url}/icp4d-api/v1/authorize"
+    USERNAME = os.getenv("USERNAME")
+    WATSONX_MODELS_URL = f"{cpd_url}/ml/v1/foundation_model_specs"
+    WATSONX_URL = f"{cpd_url}/ml/v1/text/generation?version={api_version}"
+    WATSONX_URL_CHAT = f"{cpd_url}/ml/v1/text/chat?version={api_version}"
+    WATSONX_CUSTOM_MODELS_URL = f"{cpd_url}/ml/v4/custom_foundation_models?version=2024-05-01"      
+else:
+    WATSONX_MODELS_URL = f"{WATSONX_URLS.get(region)}/ml/v1/foundation_model_specs"
+    # Construct Watsonx URLs with the version parameter
+    WATSONX_URL = f"{WATSONX_URLS.get(region)}/ml/v1/text/generation?version={api_version}"
+    WATSONX_URL_CHAT = f"{WATSONX_URLS.get(region)}/ml/v1/text/chat?version={api_version}"  
+
 # Load IBM API key, Watsonx URL, and Project ID from environment variables
 IBM_API_KEY = os.getenv("WATSONX_IAM_APIKEY")
-WATSONX_MODELS_URL = f"{WATSONX_URLS.get(region)}/ml/v1/foundation_model_specs"
 PROJECT_ID = os.getenv("WATSONX_PROJECT_ID")
-
-# Construct Watsonx URLs with the version parameter
-WATSONX_URL = f"{WATSONX_URLS.get(region)}/ml/v1/text/generation?version={api_version}"
-WATSONX_URL_CHAT = f"{WATSONX_URLS.get(region)}/ml/v1/text/chat?version={api_version}"
 
 if not IBM_API_KEY:
     logger.error("IBM API key is not set. Please set the WATSONX_IAM_APIKEY environment variable.")
@@ -118,6 +131,44 @@ def get_iam_token():
     except requests.exceptions.RequestException as err:
         logger.error(f"Error fetching IAM token: {err}")
         raise HTTPException(status_code=500, detail=f"Error fetching IAM token: {err}")
+
+# Function to fetch the IAM token
+def get_onprem_token():
+    global cached_token, token_expiration
+    current_time = time.time()
+
+    if cached_token and current_time < token_expiration:
+        logger.debug("Using cached IAM token.")
+        return cached_token
+
+    logger.debug("Fetching new token from CPD...")
+
+    try:
+        response = requests.post(
+            CPD_AUTH_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "username": f"{USERNAME}",
+                "api_key": f"{IBM_API_KEY}",
+            },
+            verify=False
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        cached_token = token_data["token"]
+        # expiers in 1h - TODO caching
+        #expires_in = token_data["expires_in"]
+
+        token_expiration = current_time + 3600 - 60
+        time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(token_expiration))
+        logger.debug(f"token fetched, expires at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(token_expiration))} seconds.")
+
+        return cached_token
+    except requests.exceptions.RequestException as err:
+        logger.error(f"Error fetching  token: {err}")
+        raise HTTPException(status_code=500, detail=f"Error fetching  token: {err}")
+
+
 
 def format_debug_output(request_data):
     headers = ["by API", "Parameter", "API Value", "Default Value", "Explanation"]
@@ -197,11 +248,22 @@ def format_debug_output(request_data):
     # Align the "Provided by API" and "Parameter" columns to the left, as well as "Explanation"
     return tabulate(table, headers, tablefmt="pretty", colalign=("center", "left", "center", "center", "left"))
 
+# get token
+def get_watsonx_token():
+    logger.info(f"On prem value: {on_prem} calculated {on_prem==1}")
+    if on_prem == "1":
+        logger.info("Getting get_onprem_token")
+        token = get_onprem_token()
+    else:
+        logger.info("Getting get_iam_token")
+        token = get_iam_token()    
+    return token
 
 # Fetch the models from Watsonx
 def get_watsonx_models():
     try:
-        token = get_iam_token()
+        token = get_watsonx_token()
+
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -217,7 +279,8 @@ def get_watsonx_models():
         response = requests.get(
             WATSONX_MODELS_URL,
             headers=headers,
-            params=params
+            params=params,
+            verify=False
         )
 
         if response.status_code == 404:
@@ -226,6 +289,30 @@ def get_watsonx_models():
 
         response.raise_for_status()  # Raise exception for any non-200 status codes
         models_data = response.json()
+
+        logger.debug(f"Count models: {models_data['total_count']}")
+
+        # get custom models
+        response = requests.get(
+            WATSONX_CUSTOM_MODELS_URL,
+            headers=headers,
+            verify=False
+        )
+
+        if response.status_code == 404:
+            logger.error("404 Not Found: The endpoint or version might be incorrect.")
+            raise HTTPException(status_code=404, detail="Watsonx Models API endpoint not found.")
+
+        response.raise_for_status()  # Raise exception for any non-200 status codes
+        custom_models_data = response.json()
+
+        logger.debug(f"Count custom models: {custom_models_data['total_count']}")
+
+        models_data["total_count"] = models_data["total_count"] + custom_models_data["total_count"]
+        models_data["resources"] = models_data["resources"] + custom_models_data["resources"]
+
+        logger.debug(f"Combined models: {models_data}")
+
         return models_data
     except requests.exceptions.RequestException as err:
         logger.error(f"Error fetching models from Watsonx.ai: {err}")
@@ -237,23 +324,16 @@ def convert_watsonx_to_openai_format(watsonx_data):
     openai_models = []
 
     for model in watsonx_data['resources']:
-        limits = model.get('model_limits', {}) or {}
-        max_output = limits.get('max_output_tokens')
-        max_seq   = limits.get('max_sequence_length')
-
         openai_model = {
             "id": model['model_id'],  # Watsonx's model_id maps to OpenAI's id
             "object": "model",  # Hardcoded, as OpenAI uses "model" as the object type
             "created": int(time.time()),  # Optional: use current timestamp or a fixed one if available
-            "owned_by": f"{model.get('provider')} / {model.get('source')}",  # Combine Watsonx's provider and source
-						"description": (
-                f"{model.get('short_description', '').strip()} "
-                f"Supports tasks like {', '.join(model.get('task_ids', []))}."
-            ).strip(),	  # Watsonx's short description
-            "max_tokens": max_output,  # Map Watsonx's max_output_tokens to OpenAI's max_tokens
+            "owned_by": f"{model['provider']} / {model['source']}",  # Combine Watsonx's provider and source
+            "description": f"{model['short_description']} Supports tasks like {', '.join(model.get('task_ids', []))}.",  # Watsonx's short description
+            "max_tokens": model['model_limits']['max_output_tokens'],  # Map Watsonx's max_output_tokens to OpenAI's max_tokens
             "token_limits": {
-                "max_sequence_length": max_seq,  # Watsonx's max_sequence_length
-                "max_output_tokens": max_output  # Watsonx's max_output_tokens
+                "max_sequence_length": model['model_limits']['max_sequence_length'],  # Watsonx's max_sequence_length
+                "max_output_tokens": model['model_limits']['max_output_tokens']  # Watsonx's max_output_tokens
             }
         }
         openai_models.append(openai_model)
@@ -268,9 +348,7 @@ def convert_watsonx_to_openai_format(watsonx_data):
 async def fetch_models():
     try:
         models = get_watsonx_models()  # Fetch the Watsonx models data
-        model_names = [m['model_id'] for m in models['resources']]
-        logger.debug(f"Available models: {model_names}")
-        # logger.debug(f"Available models: {models}")
+        logger.debug(f"Available models: {models}")
 
         # Convert Watsonx output to OpenAI-like format
         openai_like_models = convert_watsonx_to_openai_format(models)
@@ -279,6 +357,7 @@ async def fetch_models():
         return openai_like_models
     except Exception as err:
         logger.error(f"Error fetching models: {err}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching models: {err}")
 
 # FastAPI route for /v1/models/{model_id}
@@ -314,6 +393,134 @@ async def fetch_model_by_id(model_id: str):
         logger.error(f"Error fetching model by ID: {err}")
         raise HTTPException(status_code=500, detail=f"Error fetching model by ID: {err}")
 
+@app.post("/v1/completions")
+async def watsonx_completions(request: Request):
+    logger.info("Received a Watsonx completion request.")
+
+    # Parse the incoming request as JSON
+    try:
+        request_data = await request.json()
+    except Exception as e:
+        logger.error(f"Error parsing request: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON request body")
+
+    # Extract parameters from request or set default values
+    prompt = request_data.get("prompt", "")
+
+    # Ensure that prompt is a string; if it's a list, join it into a single string
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt)
+    elif not isinstance(prompt, str):
+        logger.error(f"Invalid type for 'prompt': {type(prompt)}. Expected a string or list of strings.")
+        raise HTTPException(status_code=400, detail="Invalid type for 'prompt'. Expected a string or list of strings.")
+
+    # Rest of the parameters (model_id, max_tokens, etc.)
+    model_id = request_data.get("model", "ibm/granite-3-8b-instruct")  # Default model_id
+    max_tokens = request_data.get("max_tokens", 2000)
+    temperature = request_data.get("temperature", 0.2)
+    best_of = request_data.get("best_of", 1)
+    n = request_data.get("n", 1)
+    presence_penalty = request_data.get("presence_penalty", 1)
+    echo = request_data.get("echo", False)
+    logit_bias = request_data.get("logit_bias", None)
+    logprobs = request_data.get("logprobs", None)
+    stop = request_data.get("stop", None)
+    suffix = request_data.get("suffix", None)
+    stream = request_data.get("stream", False)
+    seed = request_data.get("seed", None)
+    top_p = request_data.get("top_p", 1)
+
+    # Debugging: Log the provided parameters and their sources
+    logger.debug("Parameter source debug:")
+    logger.debug("\n" + format_debug_output(request_data))
+
+    # Get the IAM token
+    iam_token = get_watsonx_token()
+    logger.debug("Bearer token:\n")
+    logger.debug(iam_token)
+
+    # Prepare Watsonx.ai request payload
+    watsonx_payload = {
+        "input": prompt,  # Ensure 'prompt' is always a string
+        "parameters": {
+            "decoding_method": "sample",  # decoding_method = Greedy is not supported.
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_k": 50,
+            "top_p": top_p,
+            "random_seed": seed,
+            "repetition_penalty": presence_penalty,
+        },
+        "model_id": model_id,
+        "project_id": PROJECT_ID
+    }
+
+    # Optionally add optional parameters if provided
+    if stop:
+        watsonx_payload["parameters"]["stop_sequences"] = stop
+    if logit_bias:
+        watsonx_payload["parameters"]["logit_bias"] = logit_bias
+
+    # Log the prettified JSON request
+    formatted_payload = json.dumps(watsonx_payload, indent=4, ensure_ascii=False)
+    logger.debug(f"Sending request to Watsonx.ai: {formatted_payload}")
+
+    headers = {
+        "Authorization": f"Bearer {iam_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    try:
+        # Send the request to Watsonx.ai
+        response = requests.post(WATSONX_URL, json=watsonx_payload, headers=headers, verify=False)
+        response.raise_for_status()  # This will raise an HTTPError for 4xx/5xx responses
+        watsonx_data = response.json()
+        logger.debug(f"Received response from Watsonx.ai: {json.dumps(watsonx_data, indent=4)}")
+    except requests.exceptions.HTTPError as err:
+        # Capture and log the full response from Watsonx.ai
+        error_message = response.text  # Watsonx should return a more detailed error message
+        logger.error(f"HTTPError: {err}, Response: {error_message}")
+        raise HTTPException(status_code=response.status_code, detail=f"Error from Watsonx.ai: {error_message}")
+    except requests.exceptions.RequestException as err:
+        # Generic request exception handling
+        logger.error(f"RequestException: {err}")
+        raise HTTPException(status_code=500, detail=f"Error calling Watsonx.ai: {err}")
+
+    # Extract generated text from the Watsonx response
+    results = watsonx_data.get("results", [])
+    if results and "generated_text" in results[0]:
+        generated_text = results[0]["generated_text"]
+        logger.debug(f"Generated text from Watsonx.ai: \n{generated_text}")
+    else:
+        generated_text = "\n\nNo response available."
+        logger.warning("No generated text found in Watsonx.ai response.")
+
+    # Prepare the OpenAI-compatible response with model name
+    openai_response = {
+        "id": f"cmpl-{str(uuid.uuid4())[:12]}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model_id,
+        "system_fingerprint": f"fp_{str(uuid.uuid4())[:12]}",
+        "choices": [
+            {
+                "text": generated_text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": results[0].get("stop_reason", "length")
+            }
+        ],
+        "usage": {
+            "prompt_tokens": results[0].get("input_token_count", 5),
+            "completion_tokens": results[0].get("generated_token_count", 7),
+            "total_tokens": results[0].get("input_token_count", 5) + results[0].get("generated_token_count", 7)
+        }
+    }
+
+    # Return the response
+    logger.debug(f"Returning OpenAI-compatible response: {json.dumps(openai_response, indent=4)}")
+    return openai_response
 
 def extract_tool_context(content: str):
     """Extract tool context from content if present"""
@@ -325,7 +532,6 @@ def extract_tool_context(content: str):
         cleaned_content = content
         return tool_context, cleaned_content
     return None, content
-
 
 def generate_watsonx_stream(headers, payload, model_id):
 	payload["stream"] = True
@@ -451,70 +657,88 @@ def generate_watsonx_non_stream(headers, payload, model_id):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-	logger.info("Received a Watsonx chat completion request.")
-	
-	# Parse request
-	try:
-		req = await request.json()
-		logger.debug(f"Raw request JSON: {json.dumps(req, indent=2)}")
-	except Exception as e:
-		logger.error(f"Invalid request: {e}")
-		raise HTTPException(status_code=400, detail="Invalid JSON request format")
+async def watsonx_chat_completions(request: Request):
+    logger.info("Received a Watsonx completion request.")
 
-	try:
-		model_id     = req["model"]
-		messages     = req["messages"]
-	except KeyError as e:
-		logger.error(f"Missing required field in request: {e}")
-		raise HTTPException(status_code=400, detail=f"Missing required field: {e}")
+    # Parse the incoming request as JSON
+    try:
+        request_data = await request.json()
+        logger.debug(f"Received request data: {json.dumps(request_data, indent=4)}")
+    except Exception as e:
+        logger.error(f"Error parsing request: {e}")
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON request body")
+    try:
+        messages     = request_data["messages"]
+    except KeyError as e:
+        logger.error(f"Missing required field in request: {e}")
+        raise HTTPException(status_code=400, detail=f"Missing required field: {e}")
+    # Rest of the parameters (model_id, max_tokens, etc.)
+    model_id          = request_data.get("model", "ibm/granite-3-8b-instruct")  # Default model_id
+    stream            = request_data.get("stream", False)
+    max_tokens        = request_data.get("max_tokens", 1024)
+    temperature       = request_data.get("temperature", 1)
+    n                 = request_data.get("n", 1)
+    logit_bias        = request_data.get("logit_bias", None)
+    logprobs          = request_data.get("logprobs", False)
+    stop              = request_data.get("stop", None)
+    seed              = request_data.get("seed", None)
+    top_p             = request_data.get("top_p", 1)
+    frequency_penalty = request_data.get("frequency_penalty", 0)
+    presence_penalty  = request_data.get("presence_penalty", 0)
 
-	stream       = req.get("stream", False)
-	max_tokens   = req.get("max_tokens")
-	temperature  = req.get("temperature")
-	top_p        = req.get("top_p")
+	# Prepare messages
+    watson_messages = []
+    for msg in messages:
+        content = msg["content"]
+        watson_content = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        watson_messages.append({
+            "role": msg["role"],
+            "content": watson_content
+        })
 
-	# Prepare Watsonx payload
-	watson_messages = []
-	for msg in messages:
-		content = msg["content"]
-		watson_content = [{"type": "text", "text": content}] if isinstance(content, str) else content
-		watson_messages.append({
-			"role": msg["role"],
-			"content": watson_content
-		})
+    # Debugging: Log the provided parameters and their sources
+    logger.debug("Parameter source debug:")
+    logger.debug("\n" + format_debug_output(request_data))
 
-	payload = {
-		"model_id": model_id,
-		"project_id": PROJECT_ID,
-		"messages": watson_messages,
-	}
+    # Get the IAM token
+    iam_token = get_watsonx_token()
 
-	if max_tokens is not None:
-		payload["max_tokens"] = max_tokens
+    # Prepare Watsonx.ai request payload
+    watsonx_payload = {
+        "messages": watson_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "model_id": model_id,
+        "project_id": PROJECT_ID,
+        "n": n,
+        "seed": seed,
+        "logprobs": logprobs
+    }
 
-	params = {}
-	if temperature is not None:
-		params["temperature"] = temperature
-	if top_p is not None:
-		params["top_p"] = top_p
-	if params:
-		payload["parameters"] = params
+    # Optionally add optional parameters if provided
+    if stop:
+        watsonx_payload["stop"] = stop
+    if logit_bias:
+        watsonx_payload["parameters"]["logit_bias"] = logit_bias
 
-	# Log payload sent to Watsonx
-	logger.debug(f"Watsonx.ai request payload:\n{json.dumps(payload, indent=4)}")
-	
-	headers = {
-		"Authorization": f"Bearer {get_iam_token()}",
-		"Content-Type": "application/json"
-	}
+    # Log the prettified JSON request
+    formatted_payload = json.dumps(
+        watsonx_payload, indent=4, ensure_ascii=False)
+    logger.debug(f"Sending request to Watsonx.ai: {formatted_payload}")
 
-	if stream:
-		# Handle streaming response
-		return generate_watsonx_stream(headers, payload, model_id)
-	else:
-		# Handle non-streaming response
-		return generate_watsonx_non_stream(headers, payload, model_id)
-	
+    headers = {
+        "Authorization": f"Bearer {iam_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
 
-
+    if stream:
+        # Handle streaming response
+        return generate_watsonx_stream(headers, watsonx_payload, model_id)
+    else:
+        # Handle non-streaming response
+        return generate_watsonx_non_stream(headers, watsonx_payload, model_id)
