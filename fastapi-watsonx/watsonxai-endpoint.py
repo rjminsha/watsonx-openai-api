@@ -8,6 +8,7 @@ import logging
 import json
 from tabulate import tabulate
 from ibm_watsonx_ai import APIClient, Credentials
+from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 
@@ -521,6 +522,140 @@ async def watsonx_completions(request: Request):
     logger.debug(f"Returning OpenAI-compatible response: {json.dumps(openai_response, indent=4)}")
     return openai_response
 
+def extract_tool_context(content: str):
+    """Extract tool context from content if present"""
+    if "<context>" in content and "</context>" in content:
+        start_idx = content.index("<context>") + len("<context>")
+        end_idx = content.index("</context>")
+        tool_context = content[start_idx:end_idx].strip()
+        # cleaned_content = content.replace(f"<context>{tool_context}</context>", "").strip()
+        cleaned_content = content
+        return tool_context, cleaned_content
+    return None, content
+
+def generate_watsonx_stream(headers, payload, model_id):
+	payload["stream"] = True
+	headers["Accept"] = "text/event-stream"
+	
+	# open the Watsonx stream
+	try:
+		watson_resp = requests.post(
+				WATSONX_URL_CHAT,
+				headers=headers,
+				json=payload,
+				stream=True,
+				timeout=(5, None)
+		)
+		watson_resp.raise_for_status()
+	except requests.RequestException as e:
+		logger.error(f"Error opening Watsonx stream: {e}")
+		raise HTTPException(status_code=500, detail="Could not open Watsonx stream")
+
+	logger.debug(watson_resp)
+
+	def iter_events():
+		try:
+			for line in watson_resp.iter_lines(decode_unicode=True):
+				logger.debug(line)
+				if not line:
+					continue
+				if line.startswith("data:"):
+					line = line[len("data:"):].strip()
+				try:
+					chunk = json.loads(line)
+				except json.JSONDecodeError:
+					continue
+
+				# extract text in whatever shape Watsonx gave us
+				if "message" in chunk and isinstance(chunk["message"], dict):
+					text = chunk["message"].get("content", "")
+				elif "choices" in chunk:
+					# Detect the summary chunk with no choices
+					if not chunk.get("choices"):
+						# send the OpenAI‐style end‐of‐stream
+						yield "data: [DONE]\n\n"
+						break
+					text = chunk["choices"][0].get("delta", {}).get("content", "")
+				else:
+					text = chunk.get("content", "")
+
+				# check for final finish_reason
+				finish = chunk["choices"][0].get("finish_reason")
+				is_done = finish is not None or chunk.get("done")
+				
+				out = {
+					"id": chunk.get("id"),
+					"object": "chat.completion.chunk",
+					"model": model_id,
+					"choices": [
+						{
+							"delta": {"content": text},
+							"index": 0,
+							"finish_reason": finish if is_done else None
+						}
+					]
+				}
+				yield f"data: {json.dumps(out)}\n\n"
+
+				# note: NO break here—just keep reading until the server closes
+		finally:
+			watson_resp.close()
+
+	return StreamingResponse(iter_events(), media_type="text/event-stream")
+
+
+def generate_watsonx_non_stream(headers, payload, model_id):
+	try:
+		response = requests.post(WATSONX_URL_CHAT, headers=headers, json=payload)
+		response.raise_for_status()
+		data = response.json()
+		logger.debug(f"Watsonx.ai response:\n{json.dumps(data, indent=4)}")
+	except requests.exceptions.HTTPError as err:
+		logger.error(f"Watsonx HTTPError: {err}\nResponse: {response.text}")
+		raise HTTPException(status_code=response.status_code, detail=f"Error from Watsonx.ai: {response.text}")
+	except requests.exceptions.RequestException as err:
+		logger.error(f"Watsonx RequestException: {err}")
+		raise HTTPException(status_code=500, detail=f"Error calling Watsonx.ai: {err}")
+	except Exception as err:
+		logger.error(f"Unexpected error handling Watsonx.ai response: {err}")
+		raise HTTPException(status_code=500, detail="Unexpected error from Watsonx.ai")
+
+	try:        
+		# Process response: translate back to OpenAI format
+		choices = []
+		for choice in data.get("choices", []):
+			raw_msg = choice.get("message", {})
+			role    = raw_msg.get("role", "assistant")
+			content = raw_msg.get("content", "")
+			tool_context, clean_content = extract_tool_context(content)
+			
+			message = {"role": role, "content": clean_content}
+			if tool_context:
+				message["context"] = tool_context
+					
+			choices.append({
+				"index": len(choices),
+				"message": message,
+				"done_reason": choice.get("done_reason", "stop")
+			})
+				
+		response_payload = {
+			"id": data.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
+			"model": data.get("model_id", model_id),
+			"created_at": data.get("created_at", int(time.time())),
+			"object": "chat.completion",
+			"choices": choices,
+			"usage": data.get("usage", {})
+		}
+		# Log final OpenAI-style response
+		logger.debug(f"Returning OpenAI-compatible chat response:\n{json.dumps(response_payload, indent=4)}")
+		return response_payload
+			
+	except Exception as e:
+		logger.error(f"Watsonx API error: {e}")
+		raise HTTPException(status_code=500, detail="Error processing request")
+
+
 @app.post("/v1/chat/completions")
 async def watsonx_chat_completions(request: Request):
     logger.info("Received a Watsonx completion request.")
@@ -533,21 +668,34 @@ async def watsonx_chat_completions(request: Request):
         logger.error(f"Error parsing request: {e}")
         raise HTTPException(
             status_code=400, detail="Invalid JSON request body")
-
+    try:
+        messages     = request_data["messages"]
+    except KeyError as e:
+        logger.error(f"Missing required field in request: {e}")
+        raise HTTPException(status_code=400, detail=f"Missing required field: {e}")
     # Rest of the parameters (model_id, max_tokens, etc.)
-    model_id = request_data.get(
-        "model", "ibm/granite-3-8b-instruct")  # Default model_id
-    max_tokens = request_data.get("max_tokens", 1024)
-    temperature = request_data.get("temperature", 1)
-    n = request_data.get("n", 1)
-    logit_bias = request_data.get("logit_bias", None)
-    logprobs = request_data.get("logprobs", False)
-    stop = request_data.get("stop", None)
-    seed = request_data.get("seed", None)
-    top_p = request_data.get("top_p", 1)
-    messages = request_data.get("messages", "")
+    model_id          = request_data.get("model", "ibm/granite-3-8b-instruct")  # Default model_id
+    stream            = request_data.get("stream", False)
+    max_tokens        = request_data.get("max_tokens", 1024)
+    temperature       = request_data.get("temperature", 1)
+    n                 = request_data.get("n", 1)
+    logit_bias        = request_data.get("logit_bias", None)
+    logprobs          = request_data.get("logprobs", False)
+    stop              = request_data.get("stop", None)
+    seed              = request_data.get("seed", None)
+    top_p             = request_data.get("top_p", 1)
     frequency_penalty = request_data.get("frequency_penalty", 0)
-    presence_penalty = request_data.get("presence_penalty", 0)
+    presence_penalty  = request_data.get("presence_penalty", 0)
+
+	# Prepare messages
+    watson_messages = []
+    for msg in messages:
+        content = msg["content"]
+        watson_content = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        watson_messages.append({
+            "role": msg["role"],
+            "content": watson_content
+        })
 
     # Debugging: Log the provided parameters and their sources
     logger.debug("Parameter source debug:")
@@ -558,7 +706,7 @@ async def watsonx_chat_completions(request: Request):
 
     # Prepare Watsonx.ai request payload
     watsonx_payload = {
-        "messages": messages,
+        "messages": watson_messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
@@ -588,23 +736,9 @@ async def watsonx_chat_completions(request: Request):
         "Accept": "application/json"
     }
 
-    try:
-        # Send the request to Watsonx.ai
-        response = requests.post(
-            WATSONX_URL_CHAT, json=watsonx_payload, headers=headers, verify=False)
-        response.raise_for_status()  # This will raise an HTTPError for 4xx/5xx responses
-        watsonx_data = response.json()
-        logger.debug(f"Received response from Watsonx.ai: {json.dumps(watsonx_data, indent=4)}")
-    except requests.exceptions.HTTPError as err:
-        # Capture and log the full response from Watsonx.ai
-        error_message = response.text  # Watsonx should return a more detailed error message
-        logger.error(f"HTTPError: {err}, Response: {error_message}")
-        raise HTTPException(status_code=response.status_code,
-                            detail=f"Error from Watsonx.ai: {error_message}")
-    except requests.exceptions.RequestException as err:
-        # Generic request exception handling
-        logger.error(f"RequestException: {err}")
-        raise HTTPException(
-            status_code=500, detail=f"Error calling Watsonx.ai: {err}")
-
-    return watsonx_data
+    if stream:
+        # Handle streaming response
+        return generate_watsonx_stream(headers, watsonx_payload, model_id)
+    else:
+        # Handle non-streaming response
+        return generate_watsonx_non_stream(headers, watsonx_payload, model_id)
