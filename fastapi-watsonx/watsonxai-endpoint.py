@@ -179,7 +179,7 @@ def format_debug_output(request_data):
         ("Model ID", request_data.get("model", "ibm/granite-20b-multilingual"), "ibm/granite-20b-multilingual",
         "ID of the model to use for completion"),
 
-        ("Max Tokens", request_data.get("max_tokens", 2000), 2000,
+        ("Max Tokens", request_data.get("max_completion_tokens", 2000), 2000,
         "Maximum number of tokens to generate in the completion. The total tokens, prompt + completion."),
 
         ("Temperature", request_data.get("temperature", 0.2), 0.2,
@@ -330,7 +330,7 @@ def convert_watsonx_to_openai_format(watsonx_data):
             "created": int(time.time()),  # Optional: use current timestamp or a fixed one if available
             "owned_by": f"{model['provider']} / {model['source']}",  # Combine Watsonx's provider and source
             "description": f"{model['short_description']} Supports tasks like {', '.join(model.get('task_ids', []))}.",  # Watsonx's short description
-            "max_tokens": model['model_limits']['max_output_tokens'],  # Map Watsonx's max_output_tokens to OpenAI's max_tokens
+            "max_completion_tokens": model['model_limits']['max_output_tokens'],  # Map Watsonx's max_output_tokens to OpenAI's max_completion_tokens
             "token_limits": {
                 "max_sequence_length": model['model_limits']['max_sequence_length'],  # Watsonx's max_sequence_length
                 "max_output_tokens": model['model_limits']['max_output_tokens']  # Watsonx's max_output_tokens
@@ -378,7 +378,7 @@ async def fetch_model_by_id(model_id: str):
                 "created": int(time.time()),  # Optional: use current timestamp or a fixed one if available
                 "owned_by": f"{model['provider']} / {model['source']}",  # Combine Watsonx's provider and source
                 "description": f"{model['short_description']} Supports tasks like {', '.join(model.get('task_ids', []))}.",  # Watsonx's short description
-                "max_tokens": model['model_limits']['max_output_tokens'],  # Map Watsonx's max_output_tokens to OpenAI's max_tokens
+                "max_completion_tokens": model['model_limits']['max_output_tokens'],  # Map Watsonx's max_output_tokens to OpenAI's max_completion_tokens
                 "token_limits": {
                     "max_sequence_length": model['model_limits']['max_sequence_length'],  # Watsonx's max_sequence_length
                     "max_output_tokens": model['model_limits']['max_output_tokens']  # Watsonx's max_output_tokens
@@ -414,9 +414,9 @@ async def watsonx_completions(request: Request):
         logger.error(f"Invalid type for 'prompt': {type(prompt)}. Expected a string or list of strings.")
         raise HTTPException(status_code=400, detail="Invalid type for 'prompt'. Expected a string or list of strings.")
 
-    # Rest of the parameters (model_id, max_tokens, etc.)
+    # Rest of the parameters (model_id, max_completion_tokens, etc.)
     model_id = request_data.get("model", "ibm/granite-3-8b-instruct")  # Default model_id
-    max_tokens = request_data.get("max_tokens", 2000)
+    max_completion_tokens = request_data.get("max_completion_tokens", 2000)
     temperature = request_data.get("temperature", 0.2)
     best_of = request_data.get("best_of", 1)
     n = request_data.get("n", 1)
@@ -444,7 +444,7 @@ async def watsonx_completions(request: Request):
         "input": prompt,  # Ensure 'prompt' is always a string
         "parameters": {
             "decoding_method": "sample",  # decoding_method = Greedy is not supported.
-            "max_new_tokens": max_tokens,
+            "max_new_tokens": max_completion_tokens,
             "temperature": temperature,
             "top_k": 50,
             "top_p": top_p,
@@ -673,10 +673,10 @@ async def watsonx_chat_completions(request: Request):
     except KeyError as e:
         logger.error(f"Missing required field in request: {e}")
         raise HTTPException(status_code=400, detail=f"Missing required field: {e}")
-    # Rest of the parameters (model_id, max_tokens, etc.)
+    # Rest of the parameters (model_id, max_completion_tokens, etc.)
     model_id          = request_data.get("model", "ibm/granite-3-8b-instruct")  # Default model_id
     stream            = request_data.get("stream", False)
-    max_tokens        = request_data.get("max_tokens", 1024)
+    max_completion_tokens        = request_data.get("max_completion_tokens", 1024)
     temperature       = request_data.get("temperature", 1)
     n                 = request_data.get("n", 1)
     logit_bias        = request_data.get("logit_bias", None)
@@ -707,7 +707,7 @@ async def watsonx_chat_completions(request: Request):
     # Prepare Watsonx.ai request payload
     watsonx_payload = {
         "messages": watson_messages,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_completion_tokens,
         "temperature": temperature,
         "top_p": top_p,
         "frequency_penalty": frequency_penalty,
